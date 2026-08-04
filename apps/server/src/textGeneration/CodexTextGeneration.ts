@@ -90,6 +90,66 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
         ),
       );
 
+  /**
+   * Codex boots every `[mcp_servers.*]` entry from `CODEX_HOME/config.toml` on
+   * startup, including for the short-lived `codex exec` runs below. Text
+   * generation is a read-only, schema-constrained call that never uses MCP
+   * tools, so that startup is pure overhead — on a host with 14 configured MCP
+   * servers it spawns ~14 extra processes and several hundred MB per call, and
+   * title generation runs often enough for those to overlap.
+   *
+   * Run against a scoped CODEX_HOME that keeps the user's settings and auth but
+   * carries no MCP servers. `--ephemeral` means no other CODEX_HOME state is
+   * needed, and `-c mcp_servers={}` does not work: codex merges config layers
+   * rather than replacing tables.
+   */
+  const stripMcpServerTables = (config: string): string => {
+    const kept: Array<string> = [];
+    let inMcpTable = false;
+    for (const line of config.split("\n")) {
+      if (/^\s*\[\s*"?mcp_servers\b/.test(line)) {
+        inMcpTable = true;
+        continue;
+      }
+      if (inMcpTable && /^\s*\[/.test(line)) inMcpTable = false;
+      if (!inMcpTable) kept.push(line);
+    }
+    return kept.join("\n");
+  };
+
+  const makeMcpFreeCodexHome = (
+    operation: string,
+  ): Effect.Effect<string, TextGenerationError, Scope.Scope> =>
+    Effect.gen(function* () {
+      const sourceHome = codexConfig.homePath
+        ? expandHomePath(codexConfig.homePath)
+        : (resolvedEnvironment.CODEX_HOME ?? expandHomePath("~/.codex"));
+      const directory = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: `t3code-codex-home-${process.pid}-`,
+      });
+      const sourceConfig = yield* fileSystem
+        .readFileString(path.join(sourceHome, "config.toml"))
+        .pipe(Effect.orElseSucceed(() => ""));
+      yield* fileSystem.writeFileString(
+        path.join(directory, "config.toml"),
+        stripMcpServerTables(sourceConfig),
+      );
+      // Symlinked rather than copied so credentials are not duplicated to disk.
+      yield* fileSystem
+        .symlink(path.join(sourceHome, "auth.json"), path.join(directory, "auth.json"))
+        .pipe(Effect.ignore);
+      return directory;
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new TextGenerationError({
+            operation,
+            detail: "Failed to prepare MCP-free CODEX_HOME",
+            cause,
+          }),
+      ),
+    );
+
   const safeUnlink = (filePath: string): Effect.Effect<void, never> =>
     fileSystem.remove(filePath).pipe(Effect.catch(() => Effect.void));
 
@@ -173,6 +233,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
     );
     const schemaPath = yield* writeTempFile(operation, "codex-schema", schemaJson);
     const outputPath = yield* writeTempFile(operation, "codex-output", "");
+    const codexHome = yield* makeMcpFreeCodexHome(operation);
 
     const runCodexCommand = Effect.fn("runCodexJson.runCodexCommand")(function* () {
       const launchArgs = resolveCodexLaunchArgs(codexConfig.launchArgs, resolvedEnvironment);
@@ -206,7 +267,7 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       const command = ChildProcess.make(spawnCommand.command, spawnCommand.args, {
         env: {
           ...resolvedEnvironment,
-          ...(codexConfig.homePath ? { CODEX_HOME: expandHomePath(codexConfig.homePath) } : {}),
+          CODEX_HOME: codexHome,
         },
         cwd,
         shell: spawnCommand.shell,
