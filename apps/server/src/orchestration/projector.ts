@@ -327,9 +327,15 @@ export function projectEvent(
       return decodeForEvent(ThreadArchivedPayload, event.payload, event.type, "payload").pipe(
         Effect.map((payload) => ({
           ...nextBase,
+          // Drop the retained activity window. The only reader of activities in
+          // the command read model is hasOpenBlockingRequest, and an archived
+          // thread cannot start a turn, so it has nothing left to block on.
+          // Keeping them holds the last 500 activities — with full tool
+          // payloads — in memory for a thread the user has finished with.
           threads: updateThread(nextBase.threads, payload.threadId, {
             archivedAt: payload.archivedAt,
             updatedAt: payload.updatedAt,
+            activities: [],
           }),
         })),
       );
@@ -731,12 +737,16 @@ export function projectEvent(
             return nextBase;
           }
 
-          const activities = [
-            ...thread.activities.filter((entry) => entry.id !== payload.activity.id),
-            payload.activity,
-          ]
-            .toSorted(compareThreadActivities)
-            .slice(-500);
+          // An archived thread keeps no activity window — see thread.archived.
+          const activities =
+            thread.archivedAt !== null
+              ? []
+              : [
+                  ...thread.activities.filter((entry) => entry.id !== payload.activity.id),
+                  payload.activity,
+                ]
+                  .toSorted(compareThreadActivities)
+                  .slice(-500);
 
           return {
             ...nextBase,
