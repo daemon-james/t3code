@@ -204,6 +204,50 @@ function truncateDetail(value: string, limit = 180): string {
   return value.length > limit ? `${value.slice(0, limit - 3)}...` : value;
 }
 
+/**
+ * Largest string leaf kept inside a stored tool payload, in bytes.
+ *
+ * Tool results go into the event log and the activity projection verbatim, so
+ * both keep a permanent copy of whatever the tool returned. That is fine for
+ * ordinary results, but screenshot and image tools return base64 data — often
+ * double-encoded as a JSON string inside a JSON string — and a browser-driving
+ * agent produces them continuously. Measured on one host: 417 MB of a 548 MB
+ * database was image data, none of it ever read back. The model consumes the
+ * image from its context window at the time of the call; the stored copy exists
+ * only for replay.
+ *
+ * Oversized leaves are replaced with a marker recording what was dropped.
+ * Set T3CODE_MAX_TOOL_PAYLOAD_BYTES=0 to keep payloads verbatim.
+ */
+const MAX_TOOL_PAYLOAD_LEAF_BYTES = (() => {
+  const raw = process.env.T3CODE_MAX_TOOL_PAYLOAD_BYTES;
+  if (raw === undefined) return 32_768;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 32_768;
+})();
+
+const capToolPayloadValue = (value: unknown, depth = 0): unknown => {
+  if (MAX_TOOL_PAYLOAD_LEAF_BYTES === 0 || depth > 12) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return value.length > MAX_TOOL_PAYLOAD_LEAF_BYTES
+      ? `[t3code: omitted ${value.length} bytes]`
+      : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => capToolPayloadValue(entry, depth + 1));
+  }
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = capToolPayloadValue(entry, depth + 1);
+    }
+    return out;
+  }
+  return value;
+};
+
 function normalizeProposedPlanMarkdown(planMarkdown: string | undefined): string | undefined {
   const trimmed = planMarkdown?.trim();
   if (!trimmed) {
@@ -628,7 +672,9 @@ export function runtimeEventToActivities(
             itemType: event.payload.itemType,
             ...(event.payload.status ? { status: event.payload.status } : {}),
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
-            ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
+            ...(event.payload.data !== undefined
+              ? { data: capToolPayloadValue(event.payload.data) }
+              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -650,7 +696,9 @@ export function runtimeEventToActivities(
           payload: {
             itemType: event.payload.itemType,
             ...(event.payload.detail ? { detail: truncateDetail(event.payload.detail) } : {}),
-            ...(event.payload.data !== undefined ? { data: event.payload.data } : {}),
+            ...(event.payload.data !== undefined
+              ? { data: capToolPayloadValue(event.payload.data) }
+              : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
