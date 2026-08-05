@@ -746,9 +746,12 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  const resolveThreadDetail = Effect.fn("resolveThreadDetail")(function* (threadId: ThreadId) {
+  const resolveThreadDetail = Effect.fn("resolveThreadDetail")(function* (
+    threadId: ThreadId,
+    options?: { readonly includeActivities?: boolean },
+  ) {
     return yield* projectionSnapshotQuery
-      .getThreadDetailById(threadId)
+      .getThreadDetailById(threadId, options)
       .pipe(Effect.map(Option.getOrUndefined));
   });
 
@@ -1305,6 +1308,32 @@ const make = Effect.gen(function* () {
           return loadedThreadDetail;
         });
 
+      /**
+       * Same thread detail without the activity list.
+       *
+       * Activities are unbounded per thread and carry full tool payloads, so on a
+       * long thread `getThreadDetailById` reads and decodes megabytes of JSON.
+       * This memo is per runtime event, and runtime events arrive continuously
+       * while an agent works, so loading activities here costs O(thread size) per
+       * event for callers that only read `messages` / `proposedPlans`.
+       *
+       * Only the task-title lookup genuinely needs activities; it keeps using
+       * `getLoadedThreadDetail()` above.
+       */
+      let loadedThreadDetailLite: OrchestrationThread | null | undefined;
+      const getLoadedThreadDetailWithoutActivities = () =>
+        Effect.gen(function* () {
+          if (loadedThreadDetail !== undefined) {
+            return loadedThreadDetail;
+          }
+          if (loadedThreadDetailLite !== undefined) {
+            return loadedThreadDetailLite;
+          }
+          loadedThreadDetailLite =
+            (yield* resolveThreadDetail(thread.id, { includeActivities: false })) ?? null;
+          return loadedThreadDetailLite;
+        });
+
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);
       const activeTurnId = thread.session?.activeTurnId ?? null;
@@ -1506,7 +1535,7 @@ const make = Effect.gen(function* () {
           ? toTurnId(event.turnId)
           : undefined;
       if (pauseForUserTurnId) {
-        const detailedThread = yield* getLoadedThreadDetail();
+        const detailedThread = yield* getLoadedThreadDetailWithoutActivities();
         const assistantDeliveryMode: AssistantDeliveryMode = yield* Effect.map(
           serverSettingsService.getSettings,
           (settings) => (settings.enableAssistantStreaming ? "streaming" : "buffered"),
@@ -1570,7 +1599,7 @@ const make = Effect.gen(function* () {
           : undefined;
 
       if (assistantCompletion) {
-        const detailedThread = yield* getLoadedThreadDetail();
+        const detailedThread = yield* getLoadedThreadDetailWithoutActivities();
         const messages = detailedThread?.messages ?? [];
         const turnId = toTurnId(event.turnId);
         const activeAssistantMessageId = turnId
@@ -1622,7 +1651,7 @@ const make = Effect.gen(function* () {
       }
 
       if (proposedPlanCompletion) {
-        const detailedThread = yield* getLoadedThreadDetail();
+        const detailedThread = yield* getLoadedThreadDetailWithoutActivities();
         yield* finalizeBufferedProposedPlan({
           event,
           threadId: thread.id,
@@ -1635,7 +1664,7 @@ const make = Effect.gen(function* () {
       }
 
       if (event.type === "turn.completed") {
-        const detailedThread = yield* getLoadedThreadDetail();
+        const detailedThread = yield* getLoadedThreadDetailWithoutActivities();
         const messages = detailedThread?.messages ?? [];
         const proposedPlans = detailedThread?.proposedPlans ?? [];
         const turnId = toTurnId(event.turnId);

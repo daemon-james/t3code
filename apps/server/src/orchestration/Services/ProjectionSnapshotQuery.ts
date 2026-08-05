@@ -154,9 +154,16 @@ export interface ProjectionSnapshotQueryShape {
 
   /**
    * Read a single active thread detail snapshot by id.
+   *
+   * Activities dominate the cost of this read: they are unbounded per thread and
+   * carry full tool payloads, so a long thread means megabytes of JSON decoded
+   * per call. Callers that only need messages, plans, turns or session state
+   * should pass `{ includeActivities: false }`, which skips that query and
+   * returns an empty `activities` array.
    */
   readonly getThreadDetailById: (
     threadId: ThreadId,
+    options?: { readonly includeActivities?: boolean },
   ) => Effect.Effect<Option.Option<OrchestrationThread>, ProjectionRepositoryError>;
 
   /**
