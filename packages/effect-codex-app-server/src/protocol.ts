@@ -157,7 +157,13 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const incomingRequests = yield* Queue.unbounded<CodexAppServerIncomingRequest>();
     const pending = yield* Ref.make(new Map<string, CodexAppServerPendingRequest>());
     const nextRequestId = yield* Ref.make(1);
-    const remainder = yield* Ref.make("");
+    // Pending bytes of an incomplete line, held as the chunks that produced it.
+    // Joining only when a newline actually arrives keeps line assembly linear;
+    // concatenating on every chunk is quadratic in the length of a single line,
+    // and app-server lines carry whole tool payloads (page content, file reads),
+    // so a multi-megabyte line arriving in many small chunks would otherwise
+    // re-copy and re-split the whole buffer per chunk.
+    const remainder = yield* Ref.make<ReadonlyArray<string>>([]);
     const terminationHandled = yield* Ref.make(false);
 
     const logProtocol = (event: CodexAppServerProtocolLogEvent) => {
@@ -355,10 +361,17 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       Stream.decodeText(),
       Stream.runForEach((chunk) =>
         Ref.modify(remainder, (current) => {
-          const combined = current + chunk;
+          // No line break yet: keep the chunk without touching what came before.
+          if (!chunk.includes("\n")) {
+            return [[] as ReadonlyArray<string>, [...current, chunk]] as const;
+          }
+          const combined = current.length === 0 ? chunk : current.join("") + chunk;
           const lines = combined.split("\n");
           const nextRemainder = lines.pop() ?? "";
-          return [lines.map((line) => line.replace(/\r$/, "")), nextRemainder] as const;
+          return [
+            lines.map((line) => line.replace(/\r$/, "")),
+            nextRemainder.length === 0 ? [] : [nextRemainder],
+          ] as const;
         }).pipe(Effect.flatMap((lines) => Effect.forEach(lines, handleLine, { discard: true }))),
       ),
       Effect.matchEffect({
@@ -368,6 +381,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           ),
         onSuccess: () =>
           Ref.get(remainder).pipe(
+            Effect.map((pending) => pending.join("")),
             Effect.flatMap((line) => (line.trim().length === 0 ? Effect.void : handleLine(line))),
             Effect.matchEffect({
               onFailure: (error) => handleTermination(() => Effect.succeed(error)),
